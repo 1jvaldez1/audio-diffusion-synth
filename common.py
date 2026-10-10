@@ -43,6 +43,7 @@ class Config:
 
     # data
     num_classes: int = 50
+    val_fold: int = 4               # used for model selection; never for the final test
     heldout_fold: int = 5           # ESC-50 fold never seen in training
     crop_energy_frac: float = 0.25  # a crop is valid if its energy >= this fraction of the clip's loudest crop
 
