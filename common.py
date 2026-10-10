@@ -61,6 +61,7 @@ class Config:
     grad_clip: float = 1.0
     ema_halflife_frac: float = 0.1  # EMA half-life as a fraction of total_steps
     ckpt_every: int = 1000
+    milestone_every: int = 5000     # keep a permanent copy of the EMA weights this often
     log_every: int = 100
     seed: int = 42
 
@@ -319,8 +320,8 @@ def linear_to_mel(x: torch.Tensor, linear_fe: LinearFrontEnd, mel_fe: MelFrontEn
     w_mel = mel_fe.mel.mel_scale.fb.to(x.device)                        # (n_freqs, n_mels)
     per_bin = w_lin / w_lin.sum(dim=0, keepdim=True).clamp(min=1e-10)   # band power -> mean power per bin
     per_bin = per_bin / w_lin.sum(dim=1, keepdim=True).clamp(min=1e-10) # average the bands overlapping each bin
-    mapping = w_mel.T @ (w_lin * per_bin)                               # (n_mels, n_bands)
-
+    mapping = w_mel.T @ per_bin                                         # (n_mels, n_bands)
+    
     lo_lin = linear_fe.db_max - cfg.db_range
     power = 10.0 ** (((x + 1.0) / 2.0 * cfg.db_range + lo_lin) / 10.0)
     mel_db = 10.0 * torch.log10((mapping @ power).clamp(min=1e-10))
@@ -387,6 +388,8 @@ def train_diffusion(model, forward_fn, to_repr, dataset, cfg: Config, run_dir, d
 
     if ckpt_path.exists():
         ck = torch.load(ckpt_path, map_location=device)
+        assert ck["config"]["total_steps"] == cfg.total_steps, \
+            f"{ckpt_path} was trained with total_steps={ck['config']['total_steps']}; use an empty run_dir"
         model.load_state_dict(ck["model"]); ema.load_state_dict(ck["ema"])
         opt.load_state_dict(ck["opt"]); lr_sched.load_state_dict(ck["lr_sched"]); scaler.load_state_dict(ck["scaler"])
         step, losses = ck["step"], ck["losses"]
@@ -441,6 +444,9 @@ def train_diffusion(model, forward_fn, to_repr, dataset, cfg: Config, run_dir, d
             print(f"step {step}/{cfg.total_steps}  loss {losses[-1]:.4f}")
         if step % cfg.ckpt_every == 0 or step == cfg.total_steps:
             save()
+        if step % cfg.milestone_every == 0:
+            torch.save({"ema": ema.state_dict(), "step": step, "config": asdict(cfg)},
+                       run_dir / f"ema_step{step:06d}.pt")
     return ema, losses
 
 
