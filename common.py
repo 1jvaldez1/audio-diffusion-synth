@@ -160,6 +160,7 @@ def split_by_fold(data: dict, cfg: Config) -> tuple[dict, dict]:
     fold keeps them on one side. A random clip-level split would leak.
     """
     held = data["folds"] == cfg.heldout_fold
+    val = data["folds"] == cfg.val_fold
 
     def take(mask):
         return {
@@ -169,7 +170,7 @@ def split_by_fold(data: dict, cfg: Config) -> tuple[dict, dict]:
             "class_names": data["class_names"],
         }
 
-    return take(~held), take(held)
+    return take(~held & ~val), take(val), take(held)
 
 
 def valid_crop_starts(waveforms: torch.Tensor, cfg: Config) -> tuple[torch.Tensor, torch.Tensor]:
