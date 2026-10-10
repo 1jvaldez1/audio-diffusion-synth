@@ -58,7 +58,7 @@ class Config:
     batch_size: int = 32
     lr: float = 1e-4
     warmup_steps: int = 500
-    total_steps: int = 20000
+    total_steps: int = 10000
     grad_clip: float = 1.0
     ema_halflife_frac: float = 0.1  # EMA half-life as a fraction of total_steps
     ckpt_every: int = 1000
