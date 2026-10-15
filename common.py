@@ -474,6 +474,29 @@ class CodecFrontEnd:
         return (self.embed_tokens(self.tokens(wave)) - self.mean) / self.std
 
     @torch.no_grad()
+    def from_tokens(self, codes: torch.Tensor) -> torch.Tensor:
+        """Integer tokens (B, n_codebooks, frames) -> standardised token embeddings.
+
+        The training transform when tokens are cached (TokenCropDataset): no
+        encoder pass, only a table lookup.
+        """
+        return (self.embed_tokens(codes.to(self.device)) - self.mean) / self.std
+
+    @torch.no_grad()
+    def encode_clips(self, waveforms: torch.Tensor, batch: int = 16) -> torch.Tensor:
+        """Encode whole clips once: (N, 1, samples) -> int16 tokens (N, n_codebooks, frames) on CPU.
+
+        Clips are zero-padded to a whole number of frames. Each clip is encoded
+        in one pass, so every token sees the clip's surrounding audio.
+        """
+        n = -(-waveforms.shape[-1] // self.hop) * self.hop
+        out = []
+        for i in range(0, len(waveforms), batch):
+            w = F.pad(waveforms[i : i + batch].to(self.device).float(), (0, n - waveforms.shape[-1]))
+            out.append(self.model.encode(w, n_quantizers=self.n_codebooks).audio_codes[:, : self.n_codebooks].short().cpu())
+        return torch.cat(out)
+
+    @torch.no_grad()
     def to_wave(self, x: torch.Tensor, batch: int = 32) -> tuple[torch.Tensor, torch.Tensor]:
         """Generated standardised embeddings -> (waveform (B, 1, clip_samples), tokens). CPU tensors."""
         waves, codes = [], []
@@ -494,6 +517,50 @@ class CodecFrontEnd:
         with open(path) as f:
             d = json.load(f)
         return cls(cfg, n_codebooks=d["n_codebooks"], mean=d["mean"], std=d["std"], device=device, model=model)
+
+
+class TokenCropDataset(torch.utils.data.Dataset):
+    """Training set for Path B-codec with the tokens computed once, not every step.
+
+    Every training clip is encoded whole by the codec a single time. Each access
+    then cuts a fresh random window of `codec.frames` frames out of the stored
+    tokens, so the model still sees a new random crop of each clip every epoch,
+    but training no longer runs the codec encoder.
+
+    Differences from encoding each crop on the fly (CropDataset + CodecFrontEnd):
+      * Crops start on the codec's frame grid (every 320 samples = 20 ms)
+        instead of every `hop_length` samples (16 ms).
+      * Tokens near a window's edges were computed with the clip's neighbouring
+        audio in view, instead of with the crop's zero padding. The last frames
+        of a window hold real audio rather than encoded silence; they fall
+        beyond `clip_samples` and are cropped off after decoding.
+    A window is valid by the same rule as CropDataset: the energy of its first
+    `clip_samples` samples is at least `crop_energy_frac` of the clip's loudest.
+
+    Yields (tokens (n_codebooks, frames) int64, label). Use `codec.from_tokens`
+    as the training transform.
+    """
+
+    def __init__(self, split: dict, codec: CodecFrontEnd, cfg: Config, tokens: torch.Tensor | None = None):
+        self.labels, self.frames = split["labels"], codec.frames
+        self.tokens = codec.encode_clips(split["waveforms"]) if tokens is None else tokens
+        n_frames = self.tokens.shape[-1]
+        assert n_frames >= self.frames, "clips are shorter than one training window"
+        energies = []
+        for i in range(0, len(split["waveforms"]), 256):
+            sq = split["waveforms"][i : i + 256] ** 2
+            energies.append(F.avg_pool1d(sq, kernel_size=cfg.clip_samples, stride=codec.hop).squeeze(1))
+        energy = torch.cat(energies)[:, : n_frames - self.frames + 1]          # one entry per frame-aligned start
+        valid = energy >= cfg.crop_energy_frac * energy.max(dim=1, keepdim=True).values
+        self.valid_idx = [torch.nonzero(v).squeeze(1) for v in valid]
+
+    def __len__(self) -> int:
+        return len(self.tokens)
+
+    def __getitem__(self, i: int):
+        idx = self.valid_idx[i]
+        f = int(idx[torch.randint(len(idx), (1,))])
+        return self.tokens[i, :, f : f + self.frames].long(), self.labels[i]
 
 
 def build_unet2d(cfg: Config, in_channels: int = 1, dropout: float = 0.1):
