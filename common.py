@@ -213,21 +213,25 @@ class CropDataset(torch.utils.data.Dataset):
         return self.wave[i, :, s : s + self.L], self.labels[i]
 
 
-def reference_crops(split: dict, cfg: Config, k: int = 2) -> tuple[torch.Tensor, torch.Tensor]:
+def reference_crops(split: dict, cfg: Config, k: int = 2, return_clip_index: bool = False):
     """Deterministic crops for evaluation: up to k valid crops per clip, evenly spread.
 
     Use on the held-out split for the Frechet reference, and on the train split
-    for the memorisation check.
+    for the memorisation check. With return_clip_index=True a third tensor gives,
+    for every crop, the index of its clip within `split`, so crops of one clip
+    (or one source recording) can be kept together in splits and permutations.
     """
     starts, valid = valid_crop_starts(split["waveforms"], cfg)
-    L, crops, labels = cfg.clip_samples, [], []
+    L, crops, labels, clip_idx = cfg.clip_samples, [], [], []
     for i, v in enumerate(valid):
         idx = torch.nonzero(v).squeeze(1)
         pick = idx[torch.linspace(0, len(idx) - 1, k).round().long().unique()]
         for s in starts[pick].tolist():
             crops.append(split["waveforms"][i, :, s : s + L])
             labels.append(split["labels"][i])
-    return torch.stack(crops), torch.stack(labels)
+            clip_idx.append(i)
+    out = (torch.stack(crops), torch.stack(labels))
+    return out + (torch.tensor(clip_idx),) if return_clip_index else out
 
 
 # ----------------------------------------------------------------------------
@@ -329,6 +333,167 @@ def linear_to_mel(x: torch.Tensor, linear_fe: LinearFrontEnd, mel_fe: MelFrontEn
     mel_db = 10.0 * torch.log10((mapping @ power).clamp(min=1e-10))
     lo_mel = mel_fe.db_max - cfg.db_range
     return (mel_db.clamp(lo_mel, mel_fe.db_max) - lo_mel) / cfg.db_range * 2.0 - 1.0
+
+
+@torch.no_grad()
+def spec_to_wave(x: torch.Tensor, frontend: MelFrontEnd, n_iter: int = 64, batch: int = 64,
+                 seed: int = 0) -> torch.Tensor:
+    """Normalised band spectrogram (Path A mel or Path C linear) -> waveform via Griffin-Lim.
+
+    Steps: undo the fixed dB window to get band power, spread band power back to
+    the 513 STFT bins with the pseudo-inverse of the filterbank (the same
+    least-squares estimate torchaudio's InverseMelScale makes), then estimate
+    phase with Griffin-Lim. Neither path has a vocoder, so this is how their
+    samples become audio. The loss it causes is part of each path's
+    representation ceiling: pass real clips through the same function and score
+    them like the generated ones.
+
+    x: (B, 1, n_bands, spec_frames) in [-1, 1]. Returns (B, 1, clip_samples) on CPU.
+    """
+    cfg, dev = frontend.cfg, frontend.device
+    fb = frontend.fb if isinstance(frontend, LinearFrontEnd) else frontend.mel.mel_scale.fb   # (n_freqs, n_bands)
+    inv = torch.linalg.pinv(fb.T.double()).float().to(dev)                                      # (n_freqs, n_bands)
+    gl = torchaudio.transforms.GriffinLim(n_fft=cfg.n_fft, hop_length=cfg.hop_length, power=2.0,
+                                          n_iter=n_iter, length=cfg.clip_samples).to(dev)
+    lo = frontend.db_max - cfg.db_range
+    g = torch.Generator(device="cpu").manual_seed(seed)
+    out = []
+    for i in range(0, len(x), batch):
+        xb = x[i : i + batch, 0].to(dev).float()                                    # (b, n_bands, T)
+        power = 10.0 ** (((xb + 1.0) / 2.0 * cfg.db_range + lo) / 10.0)
+        stft_power = (inv @ power).clamp(min=0.0)                                   # (b, n_freqs, T)
+        torch.manual_seed(int(torch.randint(2**31 - 1, (1,), generator=g)))         # Griffin-Lim's random phase init
+        out.append(gl(stft_power).unsqueeze(1).cpu())   # not clipped: Griffin-Lim can overshoot, and clipping would add distortion
+    return torch.cat(out)
+
+
+# ----------------------------------------------------------------------------
+# 3b. Codec front end (tokenized Path B)
+# ----------------------------------------------------------------------------
+class CodecFrontEnd:
+    """Waveform <-> DAC tokens, and the continuous token embeddings Path B-codec diffuses over.
+
+    DAC (Descript Audio Codec, 16 kHz model) encodes audio at 50 frames per second.
+    Each frame is described by 12 residual codebooks of 1,024 entries; every
+    entry is an 8-dimensional vector. A frame's tokens are therefore 12 integers,
+    and their embeddings concatenate to a 96-dimensional vector.
+
+    The diffusion model works on those 96-dimensional token embeddings,
+    standardised per channel with statistics fitted on the training split. To
+    turn a generated sample back into audio, each 8-dimensional chunk is snapped
+    to its nearest codebook entry (giving real tokens), and DAC's decoder
+    synthesises the waveform from the tokens.
+
+    Clips are zero-padded from `clip_samples` to a whole number of frames that
+    divides by 8 (104 frames for the default config), so the 1D UNet can halve
+    the sequence three times. Decoded audio is cropped back to `clip_samples`.
+    """
+
+    MODEL_ID = "descript/dac_16khz"
+
+    def __init__(self, cfg: Config, n_codebooks: int = 12, mean=None, std=None, device="cpu",
+                 model=None, frame_multiple: int = 8):
+        from transformers import DacModel
+
+        self.cfg, self.device, self.n_codebooks = cfg, device, n_codebooks
+        self.model = (model if model is not None else DacModel.from_pretrained(self.MODEL_ID)).to(device).eval()
+        self.model.requires_grad_(False)
+        assert self.model.config.sampling_rate == cfg.sample_rate, "DAC model and Config disagree on sample rate"
+        self.hop = int(np.prod(self.model.config.downsampling_ratios))
+        frames = -(-cfg.clip_samples // self.hop)
+        self.frames = -(-frames // frame_multiple) * frame_multiple
+        self.padded_samples = self.frames * self.hop
+        q = self.model.quantizer.quantizers[:n_codebooks]
+        self.code_dim = q[0].codebook.weight.shape[1]
+        self.channels = n_codebooks * self.code_dim
+        self.mean = None if mean is None else torch.as_tensor(mean, dtype=torch.float32).view(1, -1, 1).to(device)
+        self.std = None if std is None else torch.as_tensor(std, dtype=torch.float32).view(1, -1, 1).to(device)
+
+    # -- tokens ---------------------------------------------------------------
+    def _pad(self, wave: torch.Tensor) -> torch.Tensor:
+        wave = wave.to(self.device).float()
+        return F.pad(wave, (0, self.padded_samples - wave.shape[-1]))
+
+    @torch.no_grad()
+    def tokens(self, wave: torch.Tensor) -> torch.Tensor:
+        """(B, 1, clip_samples) -> integer tokens (B, n_codebooks, frames)."""
+        return self.model.encode(self._pad(wave), n_quantizers=self.n_codebooks).audio_codes[:, : self.n_codebooks]
+
+    @torch.no_grad()
+    def embed_tokens(self, codes: torch.Tensor) -> torch.Tensor:
+        """Integer tokens -> unstandardised token embeddings (B, channels, frames)."""
+        q = self.model.quantizer.quantizers
+        return torch.cat([q[i].codebook(codes[:, i]).transpose(1, 2) for i in range(self.n_codebooks)], dim=1)
+
+    @torch.no_grad()
+    def snap(self, emb: torch.Tensor) -> torch.Tensor:
+        """Unstandardised embeddings -> nearest tokens (B, n_codebooks, frames).
+
+        Euclidean distance to the raw codebook vectors, because the model is
+        trained to reproduce those raw vectors. (DAC's own encoder uses cosine
+        distance on normalised vectors; that is for its encoder output, not for
+        reconstructing a codebook entry.)
+        """
+        q, d, codes = self.model.quantizer.quantizers, self.code_dim, []
+        for i in range(self.n_codebooks):
+            z = emb[:, i * d : (i + 1) * d].transpose(1, 2)                       # (B, frames, d)
+            book = q[i].codebook.weight                                           # (K, d)
+            dist = (z ** 2).sum(-1, keepdim=True) - 2 * z @ book.T + (book ** 2).sum(-1)
+            codes.append(dist.argmin(-1))
+        return torch.stack(codes, dim=1)
+
+    @torch.no_grad()
+    def tokens_to_wave(self, codes: torch.Tensor) -> torch.Tensor:
+        """Integer tokens -> (B, 1, clip_samples) on CPU."""
+        wave = self.model.decode(audio_codes=codes.to(self.device)).audio_values
+        return wave[..., : self.cfg.clip_samples].unsqueeze(1).clamp(-1, 1).cpu()
+
+    @torch.no_grad()
+    def roundtrip(self, wave: torch.Tensor, batch: int = 32) -> torch.Tensor:
+        """Real audio -> tokens -> audio. Path B-codec's representation ceiling."""
+        return torch.cat([self.tokens_to_wave(self.tokens(wave[i : i + batch])) for i in range(0, len(wave), batch)])
+
+    # -- what the diffusion model sees ------------------------------------------
+    @torch.no_grad()
+    def fit(self, waveforms: torch.Tensor, batch: int = 32) -> "CodecFrontEnd":
+        """Per-channel mean and std of the token embeddings over the given crops."""
+        s = s2 = n = 0
+        for i in range(0, len(waveforms), batch):
+            e = self.embed_tokens(self.tokens(waveforms[i : i + batch])).double()
+            s = s + e.sum(dim=(0, 2)); s2 = s2 + (e ** 2).sum(dim=(0, 2)); n += e.shape[0] * e.shape[2]
+        mean = s / n
+        std = (s2 / n - mean ** 2).clamp(min=1e-8).sqrt()
+        self.mean = mean.float().view(1, -1, 1).to(self.device)
+        self.std = std.float().view(1, -1, 1).to(self.device)
+        return self
+
+    @torch.no_grad()
+    def __call__(self, wave: torch.Tensor) -> torch.Tensor:
+        """(B, 1, clip_samples) -> standardised token embeddings (B, channels, frames)."""
+        assert self.mean is not None, "call fit() or load() first"
+        return (self.embed_tokens(self.tokens(wave)) - self.mean) / self.std
+
+    @torch.no_grad()
+    def to_wave(self, x: torch.Tensor, batch: int = 32) -> tuple[torch.Tensor, torch.Tensor]:
+        """Generated standardised embeddings -> (waveform (B, 1, clip_samples), tokens). CPU tensors."""
+        waves, codes = [], []
+        for i in range(0, len(x), batch):
+            c = self.snap(x[i : i + batch].to(self.device) * self.std + self.mean)
+            waves.append(self.tokens_to_wave(c)); codes.append(c.cpu())
+        return torch.cat(waves), torch.cat(codes)
+
+    def save(self, path) -> None:
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "w") as f:
+            json.dump({"model_id": self.MODEL_ID, "n_codebooks": self.n_codebooks,
+                       "mean": self.mean.flatten().tolist(), "std": self.std.flatten().tolist(),
+                       "config": asdict(self.cfg)}, f)
+
+    @classmethod
+    def load(cls, path, cfg: Config, device="cpu", model=None) -> "CodecFrontEnd":
+        with open(path) as f:
+            d = json.load(f)
+        return cls(cfg, n_codebooks=d["n_codebooks"], mean=d["mean"], std=d["std"], device=device, model=model)
 
 
 def build_unet2d(cfg: Config, in_channels: int = 1, dropout: float = 0.1):
