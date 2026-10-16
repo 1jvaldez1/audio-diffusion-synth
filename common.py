@@ -519,6 +519,152 @@ class CodecFrontEnd:
         return cls(cfg, n_codebooks=d["n_codebooks"], mean=d["mean"], std=d["std"], device=device, model=model)
 
 
+class LatentFrontEnd:
+    """Waveform <-> DAC's continuous latent, reduced with PCA (Path B-latent).
+
+    DAC's decoder does not read tokens directly. It reads a continuous 1,024-dim
+    vector per 20 ms frame: the sum of the 12 codebook vectors, each projected
+    back to 1,024 dims. That latent is smooth (nearby latents decode to similar
+    audio), which is what Gaussian diffusion needs and what the stacked raw
+    codebook vectors of CodecFrontEnd lacked.
+
+    1,024 dims per frame is too many to diffuse efficiently, and most of them
+    carry little variance. PCA, fitted on training-set frames only, keeps the
+    top `k` directions. Decoding inverts the PCA (dropped directions are set to
+    their training mean) and runs DAC's decoder on the continuous latent:
+    there is no snapping step.
+
+    Scaling: by default the k components are divided by ONE global scale so
+    that their average variance is 1. That keeps the PCA's ordering of
+    importance in the loss: high-variance directions (which carry most of the
+    audio) cost more to get wrong than low-variance ones. whiten=True instead
+    scales every component to unit variance, giving every direction equal
+    weight; that is the equal-weighting that let the fine codebooks swamp the
+    loss in the token-embedding run, so it is kept only as an ablation.
+
+    Tokens remain available: `to_wave` also re-quantizes the generated latent
+    with DAC's own quantizer and returns the 12 codes per frame.
+    """
+
+    def __init__(self, codec: CodecFrontEnd, k: int = 64, whiten: bool = False,
+                 mean=None, components=None, eigvals=None):
+        self.codec, self.cfg, self.device = codec, codec.cfg, codec.device
+        self.whiten = whiten
+        self.mean = None if mean is None else torch.as_tensor(mean, dtype=torch.float32, device=self.device)
+        self.components = None if components is None else torch.as_tensor(components, dtype=torch.float32, device=self.device)
+        self.eigvals = None if eigvals is None else torch.as_tensor(eigvals, dtype=torch.float32, device=self.device)
+        if self.components is not None:
+            self.set_k(k)
+        else:
+            self.k = k
+
+    # -- the 1,024-dim latent ----------------------------------------------------
+    @torch.no_grad()
+    def latent_from_tokens(self, codes: torch.Tensor) -> torch.Tensor:
+        """Integer tokens (B, n_codebooks, T) -> DAC's quantized latent (B, 1024, T)."""
+        return self.codec.model.quantizer.from_codes(codes.to(self.device).long())[0]
+
+    @torch.no_grad()
+    def latent(self, wave: torch.Tensor) -> torch.Tensor:
+        """(B, 1, clip_samples) -> DAC's quantized latent (B, 1024, frames)."""
+        return self.latent_from_tokens(self.codec.tokens(wave))
+
+    # -- PCA -------------------------------------------------------------------------
+    @torch.no_grad()
+    def fit(self, windows, batch: int = 32) -> "LatentFrontEnd":
+        """Fit the PCA on token windows from the training set.
+
+        `windows` is a sequence of integer token arrays (n_codebooks, frames),
+        for example a TokenCropDataset sampled a few times per clip, so the PCA
+        sees the same distribution of frames the diffusion model trains on.
+        The covariance is accumulated in float64, so any number of frames fits.
+        """
+        s = s2 = None; n = 0
+        for i in range(0, len(windows), batch):
+            codes = torch.stack([torch.as_tensor(windows[j]) for j in range(i, min(i + batch, len(windows)))])
+            z = self.latent_from_tokens(codes).double()                    # (b, D, T)
+            f = z.permute(0, 2, 1).reshape(-1, z.shape[1])                 # frames as rows
+            s = f.sum(0) if s is None else s + f.sum(0)
+            s2 = f.T @ f if s2 is None else s2 + f.T @ f
+            n += f.shape[0]
+        mean = s / n
+        cov = s2 / n - torch.outer(mean, mean)
+        vals, vecs = torch.linalg.eigh(cov)                                # ascending
+        order = torch.argsort(vals, descending=True)
+        self.mean = mean.float()
+        self.eigvals = vals[order].clamp(min=0).float()
+        self.components = vecs[:, order].T.contiguous().float()           # (D, D), rows = directions
+        self.set_k(self.k)
+        return self
+
+    def set_k(self, k: int) -> "LatentFrontEnd":
+        """Choose how many PCA directions to keep (no refit needed)."""
+        self.k = int(k)
+        ev = self.eigvals[: self.k]
+        if self.whiten:
+            self.scale = ev.clamp(min=1e-12).sqrt().view(1, -1, 1)
+        else:
+            self.scale = ev.mean().clamp(min=1e-12).sqrt().view(1, 1, 1).expand(1, self.k, 1)
+        return self
+
+    def explained(self, k: int | None = None) -> float:
+        """Fraction of the latent's variance kept by the top k directions."""
+        k = self.k if k is None else k
+        return float(self.eigvals[:k].sum() / self.eigvals.sum())
+
+    @torch.no_grad()
+    def project(self, z: torch.Tensor) -> torch.Tensor:
+        """(B, 1024, T) latent -> (B, k, T) scaled PCA coefficients."""
+        W = self.components[: self.k]                                      # (k, D)
+        return torch.einsum("kd,bdt->bkt", W, z - self.mean.view(1, -1, 1)) / self.scale
+
+    @torch.no_grad()
+    def unproject(self, x: torch.Tensor) -> torch.Tensor:
+        """(B, k, T) scaled coefficients -> (B, 1024, T) latent (dropped directions at their mean)."""
+        W = self.components[: self.k]
+        return torch.einsum("kd,bkt->bdt", W, x.to(self.device).float() * self.scale) + self.mean.view(1, -1, 1)
+
+    # -- what the diffusion model sees -------------------------------------------------
+    @torch.no_grad()
+    def from_tokens(self, codes: torch.Tensor) -> torch.Tensor:
+        """Training transform with cached tokens: tokens -> latent -> PCA coefficients."""
+        return self.project(self.latent_from_tokens(codes))
+
+    @torch.no_grad()
+    def __call__(self, wave: torch.Tensor) -> torch.Tensor:
+        """(B, 1, clip_samples) -> (B, k, frames) scaled PCA coefficients."""
+        return self.project(self.latent(wave))
+
+    @torch.no_grad()
+    def to_wave(self, x: torch.Tensor, batch: int = 32) -> tuple[torch.Tensor, torch.Tensor]:
+        """Generated coefficients -> (waveform (B, 1, clip_samples), re-quantized tokens). CPU tensors."""
+        waves, codes = [], []
+        for i in range(0, len(x), batch):
+            z = self.unproject(x[i : i + batch])
+            w = self.codec.model.decoder(z)[..., : self.cfg.clip_samples]
+            waves.append(w.reshape(len(z), 1, -1).clamp(-1, 1).cpu())
+            c = self.codec.model.quantizer(z, self.codec.n_codebooks)[1][:, : self.codec.n_codebooks]
+            codes.append(c.cpu())
+        return torch.cat(waves), torch.cat(codes)
+
+    @torch.no_grad()
+    def roundtrip(self, wave: torch.Tensor, batch: int = 32) -> torch.Tensor:
+        """Real audio -> tokens -> latent -> top-k PCA -> latent -> audio. Path B-latent's ceiling."""
+        return torch.cat([self.to_wave(self(wave[i : i + batch]))[0] for i in range(0, len(wave), batch)])
+
+    def save(self, path) -> None:
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        torch.save({"mean": self.mean.cpu(), "components": self.components.cpu(), "eigvals": self.eigvals.cpu(),
+                    "n_codebooks": self.codec.n_codebooks, "model_id": self.codec.MODEL_ID,
+                    "config": asdict(self.cfg)}, path)
+
+    @classmethod
+    def load(cls, path, codec: CodecFrontEnd, k: int = 64, whiten: bool = False) -> "LatentFrontEnd":
+        d = torch.load(path, map_location="cpu")
+        assert d["n_codebooks"] == codec.n_codebooks, f"{path} was fitted with {d['n_codebooks']} codebooks"
+        return cls(codec, k=k, whiten=whiten, mean=d["mean"], components=d["components"], eigvals=d["eigvals"])
+
+
 class TokenCropDataset(torch.utils.data.Dataset):
     """Training set for Path B-codec with the tokens computed once, not every step.
 

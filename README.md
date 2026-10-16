@@ -7,7 +7,8 @@ Comparing diffusion pipelines for synthetic audio generation, as a testbed for d
 |---|---|
 | `notebooks/path_a_mel_diffusion.ipynb` | Path A: 2D UNet on log-mel spectrograms. Creates the shared `frontend.json`, so run it first. |
 | `notebooks/path_b_waveform_diffusion.ipynb` | Path B (raw): 1D UNet on mu-law companded waveforms. |
-| `notebooks/path_b_codec_diffusion.ipynb` | Path B (tokenized): 1D UNet on DAC codec token embeddings, decoded back to audio by the codec. |
+| `notebooks/path_b_codec_diffusion.ipynb` | Path B (token embeddings): 1D UNet on stacked DAC codebook vectors. Kept as a negative result: the model barely learns this representation. |
+| `notebooks/path_b_latent_diffusion.ipynb` | Path B (time-domain latent): 1D UNet on DAC's continuous latent reduced with PCA, decoded by DAC. Replaces the token-embedding version. |
 | `notebooks/path_c_linear_diffusion.ipynb` | Path C: Path A's model on linear-frequency spectrograms. |
 | `notebooks/evaluate_paths.ipynb` | Scores every path against held-out real audio in one space: decoded audio, PANNs and CLAP embeddings, representation ceilings, calibrated Frechet and MMD. |
 
