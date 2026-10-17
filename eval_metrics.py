@@ -35,7 +35,7 @@ Notes on comparability
 Dependencies: numpy only.
 """
 from __future__ import annotations
-
+import zlib
 from dataclasses import dataclass
 from typing import Callable, Dict, Iterable, List, Optional, Sequence
 
@@ -462,6 +462,7 @@ def calibrated_report(
         raise ValueError("need at least 4 groups of real clips to form a real-vs-real split")
 
     rng = np.random.default_rng(seed)
+    sub_rngs = {k: np.random.default_rng([seed, zlib.crc32(k.encode())]) for k in candidates}
     floor_runs: List[Dict[str, float]] = []
     cand_runs: Dict[str, List[Dict[str, float]]] = {k: [] for k in candidates}
 
@@ -478,7 +479,7 @@ def calibrated_report(
                 sub = C[idx_b]
             else:
                 m = min(len(idx_b), len(C))
-                sub = C[rng.choice(len(C), m, replace=False)]
+                sub = C[sub_rngs[name].choice(len(C), m, replace=False)]
             cand_runs[name].append(metrics_fn(A, sub))
 
     keys = list(floor_runs[0].keys())
